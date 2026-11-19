@@ -14,4 +14,4 @@ Requires R (4.1 or later) and the packages listed at the top of each script.
 
 All code was written with the AI assistance (Claude.ai and ChatGPT) and reviewed by authors.
 
-Please contact rbilden@stanford.edu with questions.
+Please contact Rebecca Bilden (rbilden@stanford.edu) with questions.
