@@ -1,0 +1,1552 @@
+---
+title: "Global MOUD Consumption"
+author: "Rebecca Bilden"
+format: html
+editor: visual
+---
+
+## Data Prep
+
+***Load dependencies***
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(sandwich)
+library(lmtest)
+
+# Used below through `::` (not attached): fail early with a clear message if one is missing
+stopifnot(requireNamespace("glmmTMB", quietly = TRUE),   # joint model and the independent check
+          requireNamespace("MASS",    quietly = TRUE),   # mvrnorm() for the simulated intervals
+          requireNamespace("numDeriv", quietly = TRUE))  # Hessian for the full-information standard errors
+```
+
+***Settings (file name and constants) and the folder for results***
+
+```{r}
+infile      <- "incb_worldbank_panel_excel.csv"
+us          <- "US"                    # how the US is spelled in the `country` column
+high_income <- "HIC"                   # income_type is HIC, UIC (upper middle), LMIC_LIC
+drugs       <- c("methadone", "buprenorphine")
+
+# The three predictors in the main model (after log-transforming GDP and health share).
+main_terms  <- c("log_gdp", "log_health", "life_exp")
+
+# Every association is reported per 10% higher GDP per person or health spending share (the predictors are
+# logged, so a 10% rise is a step of log(1.10)) and per 1 year of life expectancy.
+step <- 1.10
+
+# Peer high-income countries (for the US / Canada comparison): high-income countries
+# other than the US and Canada that reported a numeric (positive) value for that drug
+# in at least this many of the eight periods. Set to 1 to include every reporter.
+peer_min_periods <- 4
+
+dir.create("results", showWarnings = FALSE)   # folder for the CSVs we write
+```
+
+Data in this repository is compiled from the World Bank Group and International Narcotics Control Board. Separate datasets are available for download at the following links:
+
+INCB (pdf): <https://www.incb.org/incb/en/narcotic-drugs/Technical_Reports/narcotic_drugs_reports.html>
+
+WBG life expectancy (csv): <https://data.worldbank.org/indicator/SP.DYN.LE00.IN>
+
+WBG health spending (csv): <https://data.worldbank.org/indicator/SH.XPD.CHEX.GD.ZS>
+
+***Read in and clean INCB and WBG data***
+
+```{r}
+raw <- read_csv(infile, show_col_types = FALSE)
+
+panel <- raw %>%
+  transmute(
+    country,
+    income_group    = income_type,
+    region          = country_type,
+    period          = time,
+    start_year      = as.integer(substr(time, 1, 4)),
+    end_year        = as.integer(substr(time, 6, 9)),
+    non_overlapping = as.logical(non_overlapping_period), 
+    gdp             = gdp_per_capita_current_usd,
+    life_exp        = life_expectancy,
+    health_total    = health_expenditure_pct_gdp, # total health spending, % of GDP
+    health_govt     = govt_health_expenditure_pct_gdp, # government health spending, % of GDP
+    b_value = q_b, b_symbol = q_b_symbol,
+    m_value = q_m, m_symbol = q_m_symbol
+  ) %>%
+  # Only countries with a World Bank income group are analysed 
+  filter(!is.na(income_group))
+
+```
+
+***Build panel dataset***
+
+```{r}
+# Stack so each row is one country x period x drug
+long <- bind_rows(
+  panel %>% mutate(drug = "buprenorphine", value = b_value, symbol = b_symbol),
+  panel %>% mutate(drug = "methadone",     value = m_value, symbol = m_symbol)
+) %>%
+  select(-b_value, -b_symbol, -m_value, -m_symbol)
+
+# define non numeric data
+dash <- "\u2014" # the em dash the INCB uses to mean "nil"
+
+code_consumption <- function(df, less_than_one = NA_real_) {
+  df %>%
+    mutate(
+      # case_when() takes the first rule that fits, top to bottom
+      consumption = case_when(
+        !is.na(value)  ~ value,           # a reported number: keep it
+        symbol == dash ~ 0,               # dash = nil = 0
+        symbol == "<<" ~ less_than_one,   # less than one dose
+        TRUE           ~ NA_real_         # anything else = not reported
+      ),
+
+      # AMOUNT outcome: log of consumption, cannot take log(0), so they become NA here (and are handled by the ANY USE analysis )
+      log_cons = if_else(consumption > 0, log(consumption), NA_real_),
+
+      # ANY USE outcome: 1 = some use, 0 = nil, NA = not reported.
+      # "<<" is use below one dose, so it counts as some use.
+      any_use = case_when(
+        !is.na(consumption) & consumption > 0  ~ 1,
+        !is.na(consumption) & consumption == 0 ~ 0,
+        symbol == "<<"                         ~ 1,
+        TRUE                                   ~ NA_real_
+      ),
+
+      # Used only in the single-equation sensitivity check that keeps zeros in
+      log1p_cons = log1p(consumption),
+
+      # Predictors that get logged: GDP per person and health spending as % of GDP
+      log_gdp    = log(gdp),
+      log_health = log(health_total),
+      log_govt   = log(health_govt) # used only in the government-spending sensitivity run
+    )
+}
+
+# Primary sample includes eight non-overlapping 3-year periods from 2000-2002 onward
+primary_periods <- function(df) filter(df, non_overlapping, start_year >= 2000)
+
+```
+
+***Check for unusual values (data for Supplementary Table 2; the analysis dataset behind Table 1 and the figures)***
+
+Flagged values stay in the primary models and are dropped in a sensitivity run. A positive value is flagged if it is:
+
+- above 100,000,
+- "isolated tenfold": at least 10x the country's median value AND at least 10x the value just before it AND just after it (so it cannot be the first or last value in a country's series), or
+- followed by a "persistent decline": at least 10x every later value (at least two later values are needed, so a single dip does not count).
+
+```{r}
+screen_values <- function(df) {
+  df %>%
+    filter(consumption > 0) %>%                 # screen only positive numeric values
+    arrange(country, drug, start_year) %>%      # order each country's series by time
+    group_by(country, drug) %>%                 # one series per country and drug
+    mutate(
+      i       = row_number(),                   # position within the series
+      typical = median(consumption),            # the country's median value for this drug
+      before  = lag(consumption),               # previous value in the series
+      after   = lead(consumption),              # next value in the series
+
+      isolated = !is.na(before) & !is.na(after) &
+                 consumption >= 10 * typical &
+                 consumption >= 10 * before &
+                 consumption >= 10 * after,
+
+      persistent = map_lgl(i, function(k) {
+        later <- consumption[-seq_len(k)]       # everything after position k
+        length(later) >= 2 && all(consumption[k] >= 10 * later)
+      }),
+
+      huge = consumption > 100000
+    ) %>%
+    ungroup() %>%
+    filter(isolated | persistent | huge) %>%    # keep only the flagged rows
+    # Build a readable label such as "isolated tenfold; persistent tenfold decline"
+    mutate(flag = pmap_chr(list(isolated, persistent, huge), function(i, p, h) {
+      str_c(c("isolated tenfold", "persistent tenfold decline", "above 100\u2009000")[c(i, p, h)],
+            collapse = "; ")
+    })) %>%
+    select(country, period, drug, value = consumption, flag)
+}
+
+all_coded <- code_consumption(long)                      # every window, every row
+flags     <- screen_values(primary_periods(all_coded))   # screen the primary periods
+write_csv(flags, "results/flagged_values.csv")           # Supplementary Table 2
+
+# Mark each row as a flagged value and/or in a flagged country
+# A "flagged country" is any country with a flagged value for EITHER drug
+add_flags <- function(df) {
+  df %>%
+    left_join(flags %>% transmute(country, period, drug, flag_value = TRUE),
+              by = c("country", "period", "drug")) %>%
+    mutate(flag_value   = coalesce(flag_value, FALSE),   # no match = not flagged
+           flag_country = country %in% flags$country)
+}
+
+# `dat` is the analysis dataset: primary periods only, with flags attached
+dat <- all_coded %>% primary_periods() %>% add_flags()
+write_csv(dat, "results/analysis_data.csv")              # used for Table 1 and the figures
+
+```
+
+## Main Analysis
+
+***US and Canada vs other high-income countries (data for Figure 2)***
+
+Examine MOUD consumption in the US and Canada vs other peer high-income countries
+
+```{r}
+positive <- dat %>% filter(consumption > 0)       # numeric, positive country-period values
+
+# Peers = high-income countries other than the US and Canada, kept only if they
+# reported this drug in at least `peer_min_periods` periods. Requiring several
+# periods keeps the peer group from changing a lot just because a country happened
+# to report (or not report) in one period.
+peers <- positive %>%
+  filter(income_group == high_income, !country %in% c(us, "Canada")) %>%
+  group_by(drug, country) %>%
+  filter(n_distinct(period) >= peer_min_periods) %>%
+  ungroup()
+
+# Peer median and interquartile range in each period (the grey band and line in Figure 2)
+peer_series <- peers %>%
+  group_by(drug, period) %>%
+  summarise(n_peers = n(), median = median(consumption),
+            q1 = quantile(consumption, 0.25), q3 = quantile(consumption, 0.75),
+            .groups = "drop")
+
+# The US and Canada, period by period
+us_canada <- positive %>%
+  filter(country %in% c(us, "Canada")) %>%
+  select(drug, period, country, consumption)
+
+# The 2021-2023 comparison quoted in the Results: how many times the peer median?
+peer_comparison <- us_canada %>%
+  filter(period == "2021-2023") %>%
+  left_join(peer_series %>% filter(period == "2021-2023") %>% select(drug, peer_median = median, n_peers),
+            by = "drug") %>%
+  mutate(times_peer_median = consumption / peer_median)
+
+write_csv(peer_series,     "results/peer_series.csv")
+write_csv(us_canada,       "results/us_canada_series.csv")
+write_csv(peer_comparison, "results/peer_comparison.csv")
+
+```
+
+***Fit models***
+
+Drop all nil for complete case analysis
+
+```{r}
+# Complete-case analysis: keep one drug, and keep only rows that have every
+# variable the model needs. Optionally keep only countries with >= `min_periods`
+# complete periods.
+complete_cases <- function(df, drug_name, predictors, extras = NULL, min_periods = NULL,
+                           y = "log_cons") {
+  df <- df %>%
+    filter(drug == drug_name) %>%
+    drop_na(all_of(c(y, predictors, extras)))
+
+  if (!is.null(min_periods)) {
+    df <- df %>%
+      group_by(country) %>%
+      filter(n_distinct(period) >= min_periods) %>%
+      ungroup()
+  }
+  df
+}
+
+# Pull the fixed effects out of a mixed model, with Wald 95% CIs and normal (z) inference.
+#
+# The standard errors use the FULL observed information: the Hessian of the exact
+# Gaussian log-likelihood with respect to the fixed effects AND the two variance
+# parameters, evaluated at the maximum-likelihood fit. (lme4's own standard errors
+# treat the variance parameters as known, so its intervals are slightly narrower.)
+tidy_fixed <- function(m) {
+  X    <- getME(m, "X")                      # fixed-effects design matrix
+  y    <- getME(m, "y")                      # outcome
+  g    <- getME(m, "flist")[[1]]             # country (the grouping factor)
+  nc   <- as.numeric(rowsum(rep(1, length(y)), g))   # observations per country
+  p    <- ncol(X)
+  est  <- fixef(m)
+  s_e  <- sigma(m)                                    # residual SD
+  s_u  <- sqrt(as.numeric(VarCorr(m)[[1]]))           # country random-intercept SD
+
+  # Negative log-likelihood of a random-intercept model, written out in closed form.
+  # par = c(fixed effects, log residual SD, log country SD)
+  neg_loglik <- function(par) {
+    r   <- as.numeric(y - X %*% par[1:p])             # residuals given the fixed effects
+    ve  <- exp(2 * par[p + 1])                        # residual variance
+    vu  <- exp(2 * par[p + 2])                        # country variance
+    rs  <- as.numeric(rowsum(r, g))                   # residual sums by country
+    rr  <- as.numeric(rowsum(r^2, g))                 # residual sums of squares by country
+    den <- ve + nc * vu
+    0.5 * sum((nc - 1) * log(ve) + log(den) + (rr - vu * rs^2 / den) / ve) +
+      0.5 * length(y) * log(2 * pi)
+  }
+
+  H  <- numDeriv::hessian(neg_loglik, c(est, log(s_e), log(s_u)))   # observed information
+  se <- sqrt(diag(solve(H)))[1:p]                                   # SEs for the fixed effects
+
+  tibble(term = names(est), estimate = as.numeric(est), std.error = se) %>%
+    mutate(conf.low  = estimate - 1.96 * std.error,
+           conf.high = estimate + 1.96 * std.error,
+           p.value   = 2 * pnorm(-abs(estimate / std.error)))
+}
+```
+
+***Pooled logistic regression***
+
+```{r}
+# Pooled logistic regression with country-clustered standard errors (ANY USE part).
+# There is no country random intercept here: standard errors are clustered by country
+# instead, so repeated observations of the same country are not treated as independent.
+# The 95% CI uses a t distribution with (number of countries - 1) degrees of freedom.
+pooled_logit <- function(f, df, keep) {
+  # (When a region such as North America ALWAYS reports use, its own coefficient cannot be
+  # estimated and glm warns about it. That does not affect the other coefficients, so the
+  # warning is silenced.)
+  m  <- suppressWarnings(glm(f, family = binomial, data = df))
+  ct <- coeftest(m, vcov = vcovCL(m, cluster = df$country))
+  g  <- n_distinct(df$country)
+  tibble(term = rownames(ct), estimate = ct[, 1], std.error = ct[, 2]) %>%
+    filter(term %in% keep) %>%
+    mutate(crit      = qt(0.975, g - 1),
+           conf.low  = estimate - crit * std.error,
+           conf.high = estimate + crit * std.error,
+           p.value   = 2 * pt(-abs(estimate / std.error), g - 1)) %>%
+    select(-crit)
+}
+
+# `y` is the outcome column and `binary` says whether it is a yes/no outcome:
+#   AMOUNT part:   y = "log_cons",   binary = FALSE  (linear mixed models)
+#   ANY USE part:  y = "any_use",    binary = TRUE   (pooled logistic, clustered SEs)
+#   single equation check: y = "log1p_cons", binary = FALSE
+```
+
+***Primary model (Table 2, Table 3 and Figure 3)***
+
+```{r}
+# AMOUNT: outcome ~ predictors + period (fixed effects) + random intercept for country.
+#   The random intercept accounts for repeated measures of the same country; the
+#   period effects absorb changes that are common to all countries. Fitted by maximum
+#   likelihood (REML = FALSE)
+# ANY USE: the same without the random intercept (a pooled logistic model); standard
+#   errors are clustered by country instead.
+fit_mixed <- function(df, predictors, extras = NULL, y = "log_cons", binary = FALSE) {
+  if (binary) {
+    f <- reformulate(c(predictors, extras, "period"), y)
+    return(pooled_logit(f, df, predictors) %>% mutate(model = "Primary logistic"))
+  }
+  f <- reformulate(c(predictors, extras, "period", "(1 | country)"), y)
+  tidy_fixed(lmerTest::lmer(f, data = df, REML = FALSE)) %>%
+    filter(term %in% predictors) %>%        # drop intercept and period dummies
+    mutate(model = "Primary mixed")
+}
+```
+
+***Between-within (hybrid) model (Table 2 and Figure 3)***
+
+```{r}
+# Splits every predictor into
+#   _between = the country's own average across periods (differences BETWEEN countries)
+#   _within  = this period's value minus that average   (changes WITHIN a country)
+# and puts both in the same model, so each gets its own coefficient.
+fit_hybrid <- function(df, predictors, extras = NULL, y = "log_cons", binary = FALSE) {
+  for (p in predictors) {
+    df[[paste0(p, "_between")]] <- ave(df[[p]], df$country)                 # country mean
+    df[[paste0(p, "_within")]]  <- df[[p]] - df[[paste0(p, "_between")]]    # deviation from it
+  }
+  split_terms <- c(paste0(predictors, "_between"), paste0(predictors, "_within"))
+
+  tab <- if (binary) {
+    pooled_logit(reformulate(c(split_terms, extras, "period"), y), df, split_terms)
+  } else {
+    f <- reformulate(c(split_terms, extras, "period", "(1 | country)"), y)
+    tidy_fixed(lmerTest::lmer(f, data = df, REML = FALSE)) %>% filter(term %in% split_terms)
+  }
+
+  # Relabel so "log_health_between" becomes model = "Between", term = "log_health"
+  tab %>%
+    mutate(model = if_else(str_detect(term, "_between$"), "Between", "Within"),
+           term  = str_remove(term, "_(between|within)$"))
+}
+```
+
+***Fixed-effects regression (Supplementary Table 5)***
+
+```{r}
+# A country dummy and a period dummy for every country and period, so each country is
+# compared only with itself over time. Standard errors are clustered by country. For the
+# ANY USE part this is a linear probability model, so its coefficient is a change in the
+# probability of any use.
+fit_twfe <- function(df, predictors, y = "log_cons") {
+  m  <- lm(reformulate(c(predictors, "factor(country)", "factor(period)"), y), data = df)
+  # coeftest() swaps in the cluster-robust variance matrix
+  ct <- coeftest(m, vcov = vcovCL(m, cluster = df$country))
+
+  tibble(term = rownames(ct), estimate = ct[, 1], std.error = ct[, 2], p.value = ct[, 4]) %>%
+    filter(term %in% predictors) %>%        # drop the dozens of dummy coefficients
+    # 95% CI uses a t distribution with (number of clusters - 1) degrees of freedom
+    mutate(crit      = qt(0.975, n_distinct(df$country) - 1),
+           conf.low  = estimate - crit * std.error,
+           conf.high = estimate + crit * std.error,
+           model     = "Country FE") %>%
+    select(-crit)
+}
+```
+
+***Fit three models for each drug***
+
+```{r}
+
+# Fit all three models for one drug under one specification, and return one tidy table.
+# part = "amount" (how much, among positive values), "any" (any use vs nil) or
+#        "single" (one equation, log(1 + consumption), zeros kept).
+fit_all <- function(df, drug_name, predictors = main_terms, extras = NULL,
+                    min_periods = NULL, spec = "Primary", part = "amount") {
+  y      <- c(amount = "log_cons", any = "any_use", single = "log1p_cons")[[part]]
+  binary <- part == "any"
+  d <- complete_cases(df, drug_name, predictors, extras, min_periods, y)
+
+  # If a subset leaves too few countries, skip it rather than fit a silly model
+  if (n_distinct(d$country) < 5) return(NULL)
+
+  out <- bind_rows(fit_mixed(d, predictors, extras, y, binary),
+                   fit_hybrid(d, predictors, extras, y, binary),
+                   fit_twfe(d, predictors, y)) %>%
+    select(model, term, estimate, std.error, p.value, conf.low, conf.high) %>%
+    mutate(drug = drug_name, spec = spec, part = part,
+           n_obs = nrow(d), n_countries = n_distinct(d$country))   # sample size used
+
+  # Put every association on one scale: per 10% higher GDP per person or health share, and per year of life
+  # expectancy. `effect` = exp(coefficient x step): a multiplier on consumption (amount part), an odds ratio
+  # (any-use part), or a ratio on 1 + consumption (single-equation check). The linear fixed-effects model
+  # for ANY USE is shown instead as a change in percentage POINTS in the probability of any use.
+  out <- out %>%
+    mutate(per_unit    = if_else(str_detect(term, "^log_"), log(step), 1),
+           is_linear   = part == "any" & model == "Country FE",
+           effect      = if_else(is_linear, estimate  * per_unit * 100, exp(estimate  * per_unit)),
+           effect_low  = if_else(is_linear, conf.low  * per_unit * 100, exp(conf.low  * per_unit)),
+           effect_high = if_else(is_linear, conf.high * per_unit * 100, exp(conf.high * per_unit)),
+           effect_type = case_when(is_linear ~ "percentage points",
+                                   part == "any" ~ "odds ratio",
+                                   TRUE ~ "ratio")) %>%
+    select(-per_unit, -is_linear)
+  out
+}
+```
+
+***Poisson regression***
+
+```{r}
+# Poisson regression (PPML) on the level of consumption, zeros kept: a standard way to
+# handle zeros without adding a constant. Period effects; SEs clustered by country.
+fit_ppml <- function(df, drug_name, spec = "Poisson (PPML)") {
+  d  <- complete_cases(df, drug_name, main_terms, y = "consumption")
+  m  <- glm(consumption ~ log_gdp + log_health + life_exp + factor(period),
+            family = quasipoisson, data = d)
+  ct <- coeftest(m, vcov = vcovCL(m, cluster = d$country))
+  crit <- qt(0.975, n_distinct(d$country) - 1)
+  tibble(term = rownames(ct), estimate = ct[, 1], std.error = ct[, 2], p.value = ct[, 4]) %>%
+    filter(term %in% main_terms) %>%
+    mutate(conf.low = estimate - crit * std.error, conf.high = estimate + crit * std.error,
+           model = "Poisson pooled", drug = drug_name, spec = spec, part = "single",
+           n_obs = nrow(d), n_countries = n_distinct(d$country),
+           per_unit    = if_else(str_detect(term, "^log_"), log(step), 1),       # same scale as the other models
+           effect      = exp(estimate * per_unit),
+           effect_low  = exp(conf.low  * per_unit),
+           effect_high = exp(conf.high * per_unit),
+           effect_type = "ratio") %>%
+    select(-per_unit)
+}
+```
+
+***Run primary models (results file behind Table 2, Figure 3 and Supplementary Table 5)***
+
+```{r}
+# Both parts, once for methadone and once for buprenorphine
+primary <- bind_rows(map_dfr(drugs, ~ fit_all(dat, .x, part = "amount")),
+                     map_dfr(drugs, ~ fit_all(dat, .x, part = "any")))
+write_csv(primary, "results/primary_models.csv")
+```
+
+***Unadjusted models (Supplementary Table 7)***
+
+```{r}
+# --- Unadjusted (single-predictor) models (Supplementary Table 7) ---------------
+# The same model as the primary one (country random intercept and period effects for the
+# amount part; pooled logistic with clustered SEs for the any-use part), but with ONE predictor
+# at a time. They use exactly the observations of the primary model (complete for all three
+# predictors), so any difference from the primary estimates reflects adjustment, not a
+# different sample.
+unadjusted <- map_dfr(c("amount", "any"), function(part) {
+  y      <- c(amount = "log_cons", any = "any_use")[[part]]
+  binary <- part == "any"
+  map_dfr(drugs, function(drug_name) {
+    d <- complete_cases(dat, drug_name, main_terms, y = y)
+    map_dfr(main_terms, function(term) {
+      fit_mixed(d, term, y = y, binary = binary) %>%
+        mutate(drug = drug_name, spec = "Unadjusted", part = part,
+               n_obs = nrow(d), n_countries = n_distinct(d$country))
+    })
+  })
+}) %>%
+  mutate(per_unit    = if_else(str_detect(term, "^log_"), log(step), 1),
+         effect      = exp(estimate  * per_unit),
+         effect_low  = exp(conf.low  * per_unit),
+         effect_high = exp(conf.high * per_unit),
+         effect_type = if_else(part == "any", "odds ratio", "ratio")) %>%
+  select(-per_unit)
+write_csv(unadjusted, "results/unadjusted_models.csv")      # Supplementary Table 7
+```
+
+## Sensitivity Analyses
+
+***Main sensitivity analyses (Table 3)***
+
+```{r}
+# For "below-one symbols set to 0.5" we need to re-code consumption from scratch.
+dat_lt1 <- code_consumption(long, less_than_one = 0.5) %>% primary_periods()
+
+# For the ANY USE part, the matching check drops the "<<" entries instead of counting them as use.
+dat_no_lt1 <- dat %>% mutate(any_use = if_else(symbol %in% "<<", NA_real_, any_use))
+
+# One list entry per sensitivity analysis. Each says which data to use and, where
+# relevant, a different set of predictors, extra covariates, or a minimum number of periods.
+sensitivity <- list(
+  list(spec = "Primary",                        data = dat),
+
+  # Use government instead of total health spending
+  list(spec = "Government health spending",     data = dat,
+       predictors = c("log_gdp", "log_govt", "life_exp")),
+
+  # Split by income
+  list(spec = "High income only",               data = filter(dat, income_group == high_income)),
+  list(spec = "Non-high income only",           data = filter(dat, income_group != high_income)),
+
+  # Drop life expectancy (it is closely related to income)
+  list(spec = "Without life expectancy",        data = dat,
+       predictors = c("log_gdp", "log_health")),
+
+  # Add income group or region as extra covariates
+  list(spec = "Adding income group",            data = dat, extras = "income_group"),
+  list(spec = "Adding region",                  data = dat, extras = "region"),
+
+  # Drop the US
+  list(spec = "Excluding US",                   data = filter(dat, country != us)),
+
+  # Drop flagged values / countries from the screen in section 3
+  list(spec = "Screened values omitted",        data = filter(dat, !flag_value)),
+  list(spec = "Flagged countries omitted",      data = filter(dat, !flag_country)),
+
+  # Keep countries with at least four complete periods
+  list(spec = "At least four complete periods", data = dat, min_periods = 4),
+
+  # AMOUNT part: set "<<" (less than one) to 0.5 instead of missing
+  list(spec = "Below-one symbols set to 0.5",   data = dat_lt1,    parts = "amount"),
+  # ANY USE part: drop "<<" entries instead of counting them as some use
+  list(spec = "Below-one entries excluded",     data = dat_no_lt1, parts = "any")
+)
+
+# Fit every specification for both drugs. `%||%` means "use the right side if the
+# left side is NULL", so entries without their own predictors fall back to main_terms.
+sens <- map_dfr(sensitivity, function(s) {
+  map_dfr(s$parts %||% c("amount", "any"), function(part) {      # both parts unless the entry says otherwise
+    map_dfr(drugs, ~ fit_all(s$data, .x,
+                             predictors  = s$predictors  %||% main_terms,
+                             extras      = s$extras,
+                             min_periods = s$min_periods,
+                             spec        = s$spec,
+                             part        = part))
+  })
+})
+write_csv(sens, "results/sensitivity_models.csv")
+```
+
+***Keep nil values in a single equation (Supplementary Table 4)***
+
+```{r}
+# Two common one-equation alternatives to the two-part approach:
+#   log(1 + consumption) in the same three model types, and Poisson regression (PPML).
+single <- bind_rows(
+  map_dfr(drugs, ~ fit_all(dat, .x, part = "single", spec = "Single equation: log(1 + consumption)")),
+  map_dfr(drugs, ~ fit_ppml(dat, .x))
+)
+write_csv(single, "results/single_equation_checks.csv")
+```
+
+***Joint two-part model (extra check, not in the paper)***
+
+```{r}
+# The primary analysis fits the two parts separately. As a sensitivity analysis we fit them
+# TOGETHER in one model with a country random intercept in BOTH parts:
+#   - a logistic part for "no use" (a nil entry), and
+#   - a Gamma part (log link) for the amount among country-periods with positive use.
+# glmmTMB::ziGamma does exactly this. Because the logistic part models the chance of NO use,
+# its sign is flipped below so that it reads as the odds of ANY use.
+#
+# Three results per predictor (per 10% higher GDP or health share, per year of life expectancy):
+#   "Any use (odds ratio)"           odds of reporting any use
+#   "Amount among users (ratio)"     multiplies mean consumption among users
+#   "Expected consumption (ratio)"   multiplies expected consumption overall: (chance of any
+#                                    use) x (amount among users); interval by simulation
+fit_joint <- function(df, drug_name, n_sims = 1000) {
+  d <- complete_cases(df, drug_name, main_terms, y = "consumption")   # a number or a dash; "<<" entries are excluded
+  d$country <- factor(d$country)
+
+  m <- glmmTMB::glmmTMB(
+    consumption ~ log_gdp + log_health + life_exp + period + (1 | country),
+    ziformula = ~ log_gdp + log_health + life_exp + period + (1 | country),
+    family    = glmmTMB::ziGamma(link = "log"), data = d)
+  converged <- isTRUE(m$fit$convergence == 0) && isTRUE(m$sdr$pdHess)
+
+  b_amt  <- glmmTMB::fixef(m)$cond                       # amount among users (log scale)
+  b_zero <- glmmTMB::fixef(m)$zi                         # chance of NO use (log-odds)
+  co     <- summary(m)$coefficients
+  per_unit <- c(log_gdp = log(step), log_health = log(step), life_exp = 1)
+
+  # Part 1 and 2: Wald intervals from the model's own standard errors
+  parts <- map_dfr(main_terms, function(tm) {
+    k <- per_unit[[tm]]
+    a <- co$cond[tm, ]; z <- co$zi[tm, ]
+    bind_rows(
+      tibble(component = "Any use (odds ratio)", term = tm,
+             effect = exp(-z[1] * k), effect_low = exp(-(z[1] + 1.96 * z[2]) * k),
+             effect_high = exp(-(z[1] - 1.96 * z[2]) * k)),
+      tibble(component = "Amount among users (ratio)", term = tm,
+             effect = exp(a[1] * k), effect_low = exp((a[1] - 1.96 * a[2]) * k),
+             effect_high = exp((a[1] + 1.96 * a[2]) * k)))
+  })
+
+  # Combined effect on expected consumption. Expected consumption for each row is
+  #   (1 - chance of no use) x (mean among users),
+  # using the fitted country effects. Raise one predictor (+10%, or +1 year) and compare the
+  # average. The interval comes from drawing the fixed effects from their joint distribution.
+  X   <- model.matrix(~ log_gdp + log_health + life_exp + period, d)
+  u_a <- glmmTMB::ranef(m)$cond$country[as.character(d$country), 1]
+  u_z <- glmmTMB::ranef(m)$zi$country[as.character(d$country), 1]
+  expected <- function(X, ba, bz) mean((1 - plogis(as.numeric(X %*% bz) + u_z)) * exp(as.numeric(X %*% ba) + u_a))
+  ratio <- function(tm, ba, bz) {
+    X2 <- X; X2[, tm] <- X2[, tm] + per_unit[[tm]]
+    expected(X2, ba, bz) / expected(X, ba, bz)
+  }
+  n_a <- length(b_amt); n_z <- length(b_zero)
+  V   <- vcov(m, full = TRUE)[1:(n_a + n_z), 1:(n_a + n_z)]       # amount block, then no-use block
+  set.seed(2026)
+  draws <- MASS::mvrnorm(n_sims, c(b_amt, b_zero), V)
+  combined <- map_dfr(main_terms, function(tm) {
+    r <- apply(draws, 1, function(b) ratio(tm, b[1:n_a], b[n_a + 1:n_z]))
+    tibble(component = "Expected consumption (ratio)", term = tm,
+           effect = ratio(tm, b_amt, b_zero),
+           effect_low = unname(quantile(r, 0.025)), effect_high = unname(quantile(r, 0.975)))
+  })
+
+  bind_rows(parts, combined) %>%
+    mutate(drug = drug_name, n_obs = nrow(d), n_countries = n_distinct(d$country), converged = converged)
+}
+
+joint <- map_dfr(drugs, ~ fit_joint(dat, .x))
+write_csv(joint, "results/joint_model.csv")
+```
+
+***Check between-country and within-country associations (Supplementary Table 6)***
+
+```{r}
+# A Mundlak-type test. Add each predictor's country average to the primary model. The
+# coefficient on a country average is the BETWEEN coefficient minus the WITHIN coefficient,
+# so testing whether it is zero tests whether the two are equal. If they differ, the primary
+# model (which blends them) assumes something that does not hold: that a country's baseline
+# is unrelated to its GDP, health spending and life expectancy.
+#   AMOUNT part:  linear mixed model, standard errors from the full observed information
+#   ANY USE part: pooled logistic model, country-clustered standard errors (log-odds scale)
+fit_mundlak <- function(df, drug_name, part = "amount") {
+  y      <- c(amount = "log_cons", any = "any_use")[[part]]
+  d      <- complete_cases(df, drug_name, main_terms, y = y)
+  bar    <- paste0(main_terms, "_bar")
+  for (p in main_terms) d[[paste0(p, "_bar")]] <- ave(d[[p]], d$country)     # country average
+
+  tab <- if (part == "any") {
+    pooled_logit(reformulate(c(main_terms, bar, "period"), y), d, bar)
+  } else {
+    f <- reformulate(c(main_terms, bar, "period", "(1 | country)"), y)
+    tidy_fixed(lmerTest::lmer(f, data = d, REML = FALSE)) %>% filter(term %in% bar)
+  }
+  tab %>%
+    transmute(term = str_remove(term, "_bar$"),
+              difference = estimate, conf.low, conf.high, p.value) %>%     # between minus within (raw scale)
+    # The same contrast as a ratio on the reporting scale: (between multiplier) / (within multiplier)
+    mutate(per_unit    = if_else(str_detect(term, "^log_"), log(step), 1),
+           effect      = exp(difference * per_unit),
+           effect_low  = exp(conf.low    * per_unit),
+           effect_high = exp(conf.high   * per_unit)) %>%
+    select(-per_unit) %>%
+    mutate(drug = drug_name, part = part, n_obs = nrow(d), n_countries = n_distinct(d$country))
+}
+mundlak <- bind_rows(
+  map_dfr(drugs, ~ fit_mundlak(dat, .x, "amount")),
+  map_dfr(drugs, ~ fit_mundlak(dat, .x, "any"))
+)
+write_csv(mundlak, "results/between_within_test.csv")      # Supplementary Table 6
+```
+
+***Nil entries by income group (Supplementary Table 3)***
+
+```{r}
+# How common are nil entries?
+nil_by_group <- dat %>%
+  filter(!is.na(consumption)) %>%                       # reported entries only (number or dash)
+  group_by(drug, income_group) %>%
+  summarise(reported = n(), nil = sum(consumption == 0), .groups = "drop")
+nil_all <- nil_by_group %>% group_by(drug) %>%
+  summarise(income_group = "All", reported = sum(reported), nil = sum(nil), .groups = "drop")
+nil_share <- bind_rows(nil_by_group, nil_all) %>% mutate(pct_nil = 100 * nil / reported)
+write_csv(nil_share, "results/nil_share.csv")             # Supplementary Table 3
+```
+
+***Country-average checks (Supplementary Table 1)***
+
+```{r}
+# These look only at differences BETWEEN countries: average each country's
+# variables across the periods in a window, then run ordinary least squares (OLS) with
+# one row per country. We keep only the health-share coefficient.
+country_ols <- function(df, drug_name, exclude = NULL) {
+  avg <- complete_cases(df, drug_name, main_terms) %>%
+    filter(country != exclude %||% "") %>%         # optionally leave one country out
+    group_by(country) %>%
+    summarise(across(c(log_cons, all_of(main_terms)), mean), .groups = "drop")
+
+  m <- lm(reformulate(main_terms, "log_cons"), data = avg)
+
+  # Heteroskedasticity-robust (HC1) standard errors, with normal-based 95% CIs.
+  # (With one row per country there are no repeated measures to cluster on, so
+  # robust errors are the natural protection against unequal variances.)
+  ct <- coeftest(m, vcov = vcovHC(m, type = "HC1"))
+
+  tibble(estimate  = ct["log_health", 1],
+         std.error = ct["log_health", 2]) %>%
+    mutate(conf.low    = estimate - 1.96 * std.error,
+           conf.high   = estimate + 1.96 * std.error,
+           effect      = exp(estimate  * log(step)),          # multiplier per 10% higher health share
+           effect_low  = exp(conf.low  * log(step)),
+           effect_high = exp(conf.high * log(step)),
+           n_countries = nrow(avg))
+}
+
+# Different ways of grouping the years (the file contains many overlapping windows):
+all_periods <- all_coded %>% add_flags() %>% filter(start_year >= 1996)   # every window
+three_year  <- filter(all_periods, end_year - start_year == 2, start_year >= 2000)
+
+windows <- list(
+  "Between-country OLS (primary periods)" = dat,    # the main country-average model
+  # Three-year windows that tile the calendar starting one or two years later
+  "Three-year periods starting 2001"      = filter(three_year, (start_year - 2001) %% 3 == 0),
+  "Three-year periods starting 2002"      = filter(three_year, (start_year - 2002) %% 3 == 0),
+  "All three-year windows"                = three_year,
+  "All windows"                           = all_periods   # also the early 5-year windows
+)
+
+country_avg <- map_dfr(names(windows), function(w) {
+  map_dfr(drugs, ~ country_ols(windows[[w]], .x) %>% mutate(drug = .x, spec = w))
+})
+
+# Leave one country out: refit the main country-average model once per country.
+loo <- map_dfr(drugs, function(dr) {
+  countries <- unique(complete_cases(dat, dr, main_terms)$country)
+  map_dfr(countries, ~ country_ols(dat, dr, exclude = .x) %>% mutate(drug = dr, left_out = .x))
+})
+
+# Summarise: the range of estimates, and whether every interval excluded zero
+loo_summary <- loo %>%
+  group_by(drug) %>%
+  summarise(min = min(estimate), max = max(estimate),
+            effect_min = min(effect), effect_max = max(effect),
+            all_exclude_zero = all(conf.low > 0 | conf.high < 0),
+            .groups = "drop")
+
+write_csv(country_avg, "results/country_average.csv")
+write_csv(loo_summary, "results/country_average_leave_one_out.csv")
+```
+
+## Cross-checks
+
+***The amount models against an independent fit (glmmTMB)***
+
+```{r}
+# glmmTMB fits the same Gaussian random-intercept model by maximum likelihood, and its standard
+# errors come from the Hessian over ALL parameters (fixed effects and variances), the same idea as
+# tidy_fixed() above. If both fits are right, estimates and standard errors agree closely. The check
+# stops the document if they do not.
+check_glmmTMB <- map_dfr(drugs, function(dr) {
+  d  <- complete_cases(dat, dr, main_terms, y = "log_cons")
+  m  <- glmmTMB::glmmTMB(log_cons ~ log_gdp + log_health + life_exp + period + (1 | country),
+                         data = d, family = gaussian(), REML = FALSE)
+  co <- summary(m)$coefficients$cond
+  tibble(drug = dr, term = main_terms,
+         est_glmmTMB = co[main_terms, 1], se_glmmTMB = co[main_terms, 2])
+}) %>%
+  left_join(primary %>%
+              filter(part == "amount", model == "Primary mixed") %>%
+              select(drug, term, est_mine = estimate, se_mine = std.error),
+            by = c("drug", "term")) %>%
+  mutate(abs_diff_estimate = abs(est_glmmTMB - est_mine),
+         rel_diff_se       = abs(se_glmmTMB - se_mine) / se_mine)
+
+check_glmmTMB
+
+stopifnot(all(check_glmmTMB$abs_diff_estimate < 0.001),   # estimates agree to 3 decimals
+          all(check_glmmTMB$rel_diff_se       < 0.01))    # standard errors agree within 1%
+```
+
+## Tables and Figures
+
+Every table and figure is built in its own chunk below, under its own title, from the results files written above (`results/`). Tables are written to `tables/` (one Word file plus a CSV for each table) and figures to `figures/` (PNG and PDF). Run this section after the analysis above, or on its own once `results/` exists.
+
+| Table or figure | Built from |
+|---|---|
+| Table 1 | `results/analysis_data.csv` |
+| Table 2 and Table 2 continued | `results/primary_models.csv` |
+| Table 3 and Table 3 continued | `results/sensitivity_models.csv` |
+| Supplementary Table 1 | `results/country_average.csv`, `results/country_average_leave_one_out.csv` |
+| Supplementary Table 2 | `results/flagged_values.csv` |
+| Supplementary Table 3 | `results/nil_share.csv` |
+| Supplementary Table 4 | `results/single_equation_checks.csv` |
+| Supplementary Table 5 | `results/primary_models.csv` (country fixed-effects rows) |
+| Supplementary Table 6 | `results/between_within_test.csv` |
+| Supplementary Table 7 | `results/unadjusted_models.csv`, `results/primary_models.csv` |
+| Figure 1 | `results/analysis_data.csv` |
+| Figure 2 | `results/peer_series.csv`, `results/us_canada_series.csv` |
+| Figure 3 | `results/primary_models.csv` |
+| Supplementary Figure 1 | the panel file (`incb_worldbank_panel_excel.csv`) |
+
+### Set up
+
+***Load packages and create folders for tables and figures***
+
+```{r}
+#| label: tf-packages
+library(flextable)   # builds nicely formatted tables
+library(officer)     # writes those tables into a Word file
+library(ggbeeswarm)  # spreads dots out so they do not overlap (Figure 1)
+stopifnot(requireNamespace("ragg", quietly = TRUE))   # PNG device used when saving the figures
+
+dir.create("tables",  showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+```
+
+***Read the results written above***
+
+```{r}
+#| label: tf-read-results
+dat        <- read_csv("results/analysis_data.csv",                 show_col_types = FALSE)  # the analysis dataset
+primary_all <- read_csv("results/primary_models.csv",               show_col_types = FALSE)  # Table 2 / Figure 3
+sens_all    <- read_csv("results/sensitivity_models.csv",           show_col_types = FALSE)  # Table 3
+single_all  <- read_csv("results/single_equation_checks.csv",       show_col_types = FALSE)  # Supp. Table 4
+nil_share   <- read_csv("results/nil_share.csv",                    show_col_types = FALSE)  # Supp. Table 3
+joint_all   <- read_csv("results/joint_model.csv",                  show_col_types = FALSE)  # Supp. Table 5
+bw_test     <- read_csv("results/between_within_test.csv",          show_col_types = FALSE)  # Supp. Table 6
+unadjusted  <- read_csv("results/unadjusted_models.csv",            show_col_types = FALSE)  # Supp. Table 7
+
+# Two parts: AMOUNT (how much, among positive values) and ANY USE (any use vs nil)
+primary     <- filter(primary_all, part == "amount")
+primary_any <- filter(primary_all, part == "any")
+sens        <- filter(sens_all,    part == "amount")
+sens_any    <- filter(sens_all,    part == "any")
+country_av <- read_csv("results/country_average.csv",               show_col_types = FALSE)  # Supp. Table 1
+loo        <- read_csv("results/country_average_leave_one_out.csv", show_col_types = FALSE)  # Supp. Table 1 (last row)
+flags      <- read_csv("results/flagged_values.csv",                show_col_types = FALSE)  # Supp. Table 2
+```
+
+***Labels and formatting helpers (Lancet style: mid-dot decimals, thin-space thousands)***
+
+```{r}
+#| label: tf-helpers
+drugs <- c("methadone", "buprenorphine")
+
+# Nicer names for the drug and income-group codes in the data
+drug_label  <- c(methadone = "Methadone", buprenorphine = "Buprenorphine")
+group_label <- c(HIC = "High income", UIC = "Upper middle income",
+                 LMIC_LIC = "Low or lower middle income")
+
+# Format a number with a fixed number of decimals and a true minus sign (U+2212),
+# e.g. -0.39 -> "−0.39". The manuscript uses this character.
+num <- function(x, digits = 2) {
+  formatC(x, format = "f", digits = digits) %>%
+    str_replace("^-", "\u2212") %>%
+    str_replace("\\.", "\u00b7")          # Lancet style: mid-dot as the decimal mark
+}
+
+# Thousands: no separator for four-digit numbers, a thin space (U+2009) from five digits (SI / Lancet style)
+thou <- function(x) {
+  x   <- as.character(x)
+  big <- !is.na(x) & str_detect(x, "^\\d{5,}$")
+  x[big] <- formatC(as.numeric(x[big]), format = "d", big.mark = "\u2009")
+  x
+}
+
+# Format an estimate and its confidence interval: "0·72 (0·46 to 0·98)"
+est_ci <- function(est, lo, hi, digits = 2) {
+  str_c(num(est, digits), " (", num(lo, digits), " to ", num(hi, digits), ")")
+}
+
+# Format big numbers for Table 1: one decimal, thin-space thousands from five digits, and no ".0"
+# (so 51 stays "51", 657.5 becomes "657·5" and 2345.25 becomes "2345·2").
+big <- function(x) {
+  s   <- str_remove(formatC(x, format = "f", digits = 1), "\\.0$")      # one decimal, no ".0"
+  int <- str_extract(s, "^\\d+")
+  str_replace(s, "^\\d+", thou(int)) %>% str_replace("\\.", "\u00b7")  # thin-space thousands, mid-dot decimal
+}
+
+# Turn a data frame into a clean, journal-style Word table
+make_flextable <- function(df) {
+  flextable(df) %>%
+    theme_booktabs() %>%            # horizontal rules only, no vertical lines
+    bold(part = "header") %>%
+    fontsize(size = 9, part = "all") %>%
+    autofit()
+}
+```
+
+### Table 1: Consumption by income group
+
+Median (interquartile range) of the positive numeric country-period values, with the number of contributing countries and observations.
+
+```{r}
+#| label: table-1
+# Median (interquartile range) of the positive numeric country-period values,
+# plus how many countries and observations contribute.
+positive <- dat %>% filter(consumption > 0)
+
+# One function so the by-group rows and the "All countries" row are computed identically
+summarise_group <- function(df) {
+  df %>% summarise(
+    median      = median(consumption),
+    q1          = quantile(consumption, 0.25),
+    q3          = quantile(consumption, 0.75),
+    n_countries = n_distinct(country),
+    n_obs       = n(),
+    .groups = "drop")
+}
+
+table1 <- bind_rows(
+  positive %>% group_by(drug, income_group) %>% summarise_group(),                    # by income group
+  positive %>% group_by(drug)               %>% summarise_group() %>%                 # all countries
+    mutate(income_group = "All")
+) %>%
+  mutate(
+    # Paste everything into one cell, e.g. "657·5 (53·5–2345·2) 63 countries / 428 observations"
+    cell = str_c(big(median), " (", big(q1), "\u2013", big(q3), ") ",
+                 n_countries, " countries / ", n_obs, " observations"),
+    income_group = recode(income_group, !!!group_label, All = "All countries")
+  ) %>%
+  select(income_group, drug, cell) %>%
+  pivot_wider(names_from = drug, values_from = cell) %>%           # one column per drug
+  arrange(match(income_group, c(group_label, "All countries"))) %>% # keep the usual row order
+  select(`Income group` = income_group,
+         Methadone = methadone, Buprenorphine = buprenorphine)
+
+
+
+knitr::kable(table1)
+```
+
+### Table 2: Ratio of consumption (amount among users)
+
+Primary mixed model and the between / within split, one panel per drug.
+
+```{r}
+#| label: table-2
+model_order      <- c("Primary mixed", "Between", "Within", "Country FE")   # all four (used in Figure 3)
+model_order_main <- c("Primary mixed", "Between", "Within")                  # main-text table columns
+# (The country fixed-effects results are in Supplementary Table 5: they answer almost the same
+# question as the "within" column, comparing each country with itself over time.)
+term_label  <- c(log_gdp = "GDP per person",
+                 log_health = "Health share",
+                 life_exp = "Life expectancy")
+
+make_table2 <- function(drug_name) {
+  primary %>%
+    filter(drug == drug_name, model %in% model_order_main) %>%
+    mutate(
+      # `effect` = ratio of consumption per 10% higher GDP / health share, or per year of life expectancy
+      cell      = est_ci(effect, effect_low, effect_high),
+      Predictor = factor(term_label[term], levels = term_label),
+      model     = factor(model, levels = model_order_main)
+    ) %>%
+    select(Predictor, model, cell) %>%
+    pivot_wider(names_from = model, values_from = cell) %>%   # one column per model type
+    arrange(Predictor) %>%
+    mutate(Predictor = as.character(Predictor))
+}
+
+# Panel heading, e.g. "Methadone — 661 observations / 110 countries"
+n_label <- function(drug_name) {
+  p <- primary %>% filter(drug == drug_name) %>% slice(1)
+  str_c(drug_label[[drug_name]], " \u2014 ", p$n_obs, " observations / ", p$n_countries, " countries")
+}
+
+table2_meth <- make_table2("methadone")
+table2_bup  <- make_table2("buprenorphine")
+
+
+
+knitr::kable(table2_meth)
+knitr::kable(table2_bup)
+```
+
+### Table 3: Health-share ratio under each sensitivity analysis
+
+Ratio of consumption per 10% higher health-spending share, from the primary mixed model under each sensitivity analysis.
+
+```{r}
+#| label: table-3
+# Order the rows the way they appear in the manuscript
+spec_order <- c("Primary", "Government health spending", "High income only",
+                "Non-high income only", "Without life expectancy", "Adding income group",
+                "Adding region", "Excluding US", "Screened values omitted",
+                "Flagged countries omitted", "At least four complete periods",
+                "Below-one symbols set to 0.5")
+
+table3 <- sens %>%
+  # Take the primary mixed model, and the "health share" term. In the government-spending
+  # run that term is called log_govt, so we keep both names.
+  filter(model == "Primary mixed", term %in% c("log_health", "log_govt")) %>%
+  mutate(cell = est_ci(effect, effect_low, effect_high),
+         n    = str_c(n_obs, " / ", n_countries)) %>%
+  select(spec, drug, cell, n) %>%
+  pivot_wider(names_from = drug, values_from = c(cell, n)) %>%   # cell_methadone, n_methadone, ...
+  arrange(match(spec, spec_order)) %>%
+  select(Specification = spec,
+         `Methadone ratio per 10% (95% CI)`      = cell_methadone,
+         `Methadone N obs / countries`           = n_methadone,
+         `Buprenorphine ratio per 10% (95% CI)`  = cell_buprenorphine,
+         `Buprenorphine N obs / countries`       = n_buprenorphine)
+
+
+
+knitr::kable(table3)
+```
+
+### Table 2 continued and Table 3 continued: the any-use part
+
+The same models for whether any use was reported (odds ratios), and the any-use version of Table 3.
+
+```{r}
+#| label: table-2-3-continued
+# Columns are odds ratios: for GDP and health share, per 10% higher; for life expectancy, per YEAR.
+model_order_any <- c("Primary logistic", "Between", "Within")
+
+make_table2_any <- function(drug_name) {
+  primary_any %>%
+    filter(drug == drug_name, model %in% model_order_any) %>%
+    mutate(
+      digits = 2,
+      cell   = map_chr(seq_along(effect), ~ est_ci(effect[.x], effect_low[.x], effect_high[.x], digits[.x])),
+      Predictor = factor(term_label[term], levels = term_label),
+      model     = factor(model, levels = model_order_any)
+    ) %>%
+    select(Predictor, model, cell) %>%
+    pivot_wider(names_from = model, values_from = cell) %>%
+    arrange(Predictor) %>%
+    mutate(Predictor = as.character(Predictor))
+}
+n_label_any <- function(drug_name) {
+  p <- primary_any %>% filter(drug == drug_name) %>% slice(1)
+  str_c(drug_label[[drug_name]], " \u2014 any use: ", p$n_obs, " observations / ", p$n_countries, " countries")
+}
+table2_any_meth <- make_table2_any("methadone")
+table2_any_bup  <- make_table2_any("buprenorphine")
+
+# TABLE 3 CONTINUED: health-share sensitivity analyses for the ANY USE part
+spec_order_any <- c(setdiff(spec_order, "Below-one symbols set to 0.5"), "Below-one entries excluded")
+table3_any <- sens_any %>%
+  filter(model == "Primary logistic", term %in% c("log_health", "log_govt")) %>%
+  mutate(cell = est_ci(effect, effect_low, effect_high),
+         n    = str_c(n_obs, " / ", n_countries)) %>%
+  select(spec, drug, cell, n) %>%
+  pivot_wider(names_from = drug, values_from = c(cell, n)) %>%
+  arrange(match(spec, spec_order_any)) %>%
+  select(Specification = spec,
+         `Methadone odds ratio per 10% (95% CI)`     = cell_methadone,
+         `Methadone N obs / countries`                    = n_methadone,
+         `Buprenorphine odds ratio per 10% (95% CI)` = cell_buprenorphine,
+         `Buprenorphine N obs / countries`                = n_buprenorphine)
+
+
+
+knitr::kable(table2_any_meth)
+knitr::kable(table2_any_bup)
+knitr::kable(table3_any)
+```
+
+### Supplementary Table 1: Between-country robustness checks
+
+Health-share ratio from OLS regressions of country averages, with the leave-one-country-out summary in the last row.
+
+```{r}
+#| label: supp-table-1
+supp1 <- country_av %>%
+  mutate(cell = est_ci(effect, effect_low, effect_high)) %>%
+  select(Specification = spec, drug, cell) %>%
+  pivot_wider(names_from = drug, values_from = cell) %>%
+  select(Specification, Methadone = methadone, Buprenorphine = buprenorphine) %>%
+  # Add the leave-one-country-out row: the range of estimates across all the refits
+  bind_rows(tibble(
+    Specification = "Leave one country out",
+    Methadone = loo %>% filter(drug == "methadone") %>%
+      with(str_c(num(effect_min), "\u2013", num(effect_max),
+                 if_else(all_exclude_zero, "; all intervals exclude 1", ""))),
+    Buprenorphine = loo %>% filter(drug == "buprenorphine") %>%
+      with(str_c(num(effect_min), "\u2013", num(effect_max),
+                 if_else(all_exclude_zero, "; all intervals exclude 1", "")))
+  ))
+
+
+
+knitr::kable(supp1)
+```
+
+### Supplementary Table 2: Values flagged by the diagnostic screen
+
+Candidates for source verification, not confirmed errors.
+
+```{r}
+#| label: supp-table-2
+supp2 <- flags %>%
+  arrange(match(drug, drugs), country) %>%        # methadone first, then alphabetical
+  transmute(Country    = country,
+            Period     = str_replace(period, "-", "\u2013"),    # en dash between years
+            Medication = drug_label[drug],
+            Value      = thou(format(value, scientific = FALSE, trim = TRUE)),   # thin-space thousands from five digits
+            Flag       = flag)
+
+
+
+knitr::kable(supp2)
+```
+
+### Supplementary Table 3: Nil entries as a share of reported entries
+
+Nil (dash) entries by income group.
+
+```{r}
+#| label: supp-table-3
+# Nil entries (dashes) as a share of all reported entries (a number or a dash).
+supp3 <- nil_share %>%
+  mutate(income = recode(income_group, !!!group_label, All = "All countries"),
+         cell   = str_c(nil, " of ", reported, " (", floor(pct_nil + 0.5), "%)")) %>%   # round half up (R rounds 80.5 to 80)
+  select(income, drug, cell) %>%
+  pivot_wider(names_from = drug, values_from = cell) %>%
+  arrange(match(income, c(group_label, "All countries"))) %>%
+  select(`Income group` = income, Methadone = methadone, Buprenorphine = buprenorphine)
+
+
+knitr::kable(supp3)
+```
+
+### Supplementary Table 4: Single-equation checks that keep nil values
+
+log(1 + consumption) models and Poisson regression, compared with the amount-among-users model.
+
+```{r}
+#| label: supp-table-4
+# Health-share coefficient (95% CI). The first row is the primary AMOUNT model for comparison.
+supp4_long <- bind_rows(
+  primary    %>% filter(model == "Primary mixed",  term == "log_health") %>% mutate(label = "Amount among users (primary model)"),
+  single_all %>% filter(model == "Primary mixed",  term == "log_health") %>% mutate(label = "log(1 + consumption), mixed model"),
+  single_all %>% filter(model == "Between",        term == "log_health") %>% mutate(label = "log(1 + consumption), between countries"),
+  single_all %>% filter(model == "Within",         term == "log_health") %>% mutate(label = "log(1 + consumption), within countries"),
+  single_all %>% filter(model == "Country FE",     term == "log_health") %>% mutate(label = "log(1 + consumption), country fixed effects"),
+  single_all %>% filter(model == "Poisson pooled", term == "log_health") %>% mutate(label = "Poisson (PPML), clustered standard errors")
+)
+supp4 <- supp4_long %>%
+  mutate(cell = est_ci(effect, effect_low, effect_high),
+         n    = str_c(n_obs, " / ", n_countries)) %>%
+  select(label, drug, cell, n) %>%
+  pivot_wider(names_from = drug, values_from = c(cell, n)) %>%
+  arrange(match(label, unique(supp4_long$label))) %>%
+  select(Specification = label,
+         `Methadone ratio per 10% (95% CI)`    = cell_methadone,
+         `Methadone N obs / countries`        = n_methadone,
+         `Buprenorphine ratio per 10% (95% CI)` = cell_buprenorphine,
+         `Buprenorphine N obs / countries`    = n_buprenorphine)
+
+
+
+knitr::kable(supp4)
+```
+
+### Extra (not in the paper): Joint two-part model
+
+Both parts fitted together. Written to `tables/extra_joint_model.csv` and shown here only.
+
+```{r}
+#| label: extra-joint-model
+# Kept for the analysis record; written to tables/extra_joint_model.csv but not to the Word file.
+# One model with a country random intercept in both parts. Effects are per 10% higher GDP
+# and health share, and per YEAR of life expectancy.
+component_order <- c("Any use (odds ratio)", "Amount among users (ratio)", "Expected consumption (ratio)")
+extra_joint <- joint_all %>%
+  mutate(Specification = str_c(term_label[term], ": ", str_to_lower(str_sub(component, 1, 1)), str_sub(component, 2)),
+         cell = est_ci(effect, effect_low, effect_high)) %>%
+  select(Specification, term, component, drug, cell) %>%
+  pivot_wider(names_from = drug, values_from = cell) %>%
+  arrange(match(term, names(term_label)), match(component, component_order)) %>%
+  select(Specification, Methadone = methadone, Buprenorphine = buprenorphine)
+joint_n <- joint_all %>% distinct(drug, n_obs, n_countries)     # sample sizes for the caption
+
+
+
+knitr::kable(extra_joint)
+```
+
+### Supplementary Table 5: Country fixed-effects models
+
+Country and period effects; standard errors clustered by country (both parts).
+
+```{r}
+#| label: supp-table-5
+# Every country is compared only with itself over time (country and period effects, standard
+# errors clustered by country). AMOUNT part: ratio of consumption. ANY USE part: a
+# linear probability model, shown as the change in percentage POINTS in the probability of any use
+# per 10% higher GDP and health share, or per year of life expectancy.
+fe_amount <- primary %>%
+  filter(model == "Country FE") %>%
+  mutate(cell   = est_ci(effect, effect_low, effect_high),
+         column = str_c(drug_label[drug], ": amount")) %>%
+  select(term, column, cell)
+fe_any <- primary_any %>%
+  filter(model == "Country FE") %>%
+  mutate(cell   = est_ci(effect, effect_low, effect_high, 2),
+         column = str_c(drug_label[drug], ": any use (percentage points)")) %>%
+  select(term, column, cell)
+supp5 <- bind_rows(fe_amount, fe_any) %>%
+  pivot_wider(names_from = column, values_from = cell) %>%
+  arrange(match(term, names(term_label))) %>%
+  mutate(Predictor = term_label[term]) %>%
+  select(Predictor, `Methadone: amount`, `Methadone: any use (percentage points)`,
+         `Buprenorphine: amount`, `Buprenorphine: any use (percentage points)`)
+
+
+
+knitr::kable(supp5)
+```
+
+### Supplementary Table 6: Do the between- and within-country associations differ?
+
+Ratio of the between-country to the within-country association, from the primary model with each predictor's country average added.
+
+```{r}
+#| label: supp-table-6
+# RATIO of the between-country to the within-country association (95% CI), with the p-value of the
+# test that they are equal. A ratio far from 1 means the primary model, which blends the two, is not a
+# good summary. AMOUNT: ratio of the consumption multipliers. ANY USE: ratio of the odds ratios.
+p_fmt <- function(p) if_else(p < 0.001, "p < 0\u00b7001", str_c("p = ", num(p, 3)))
+supp6 <- bw_test %>%
+  mutate(cell   = str_c(est_ci(effect, effect_low, effect_high), "; ", p_fmt(p.value)),
+         column = str_c(drug_label[drug], ": ", if_else(part == "amount", "amount", "any use"))) %>%
+  select(term, column, cell) %>%
+  pivot_wider(names_from = column, values_from = cell) %>%
+  arrange(match(term, names(term_label))) %>%
+  mutate(Predictor = term_label[term]) %>%
+  select(Predictor, `Methadone: amount`, `Buprenorphine: amount`,
+         `Methadone: any use`, `Buprenorphine: any use`)
+
+
+
+knitr::kable(supp6)
+```
+
+### Supplementary Table 7: Unadjusted and adjusted estimates
+
+Each predictor on its own versus all three together, on the same observations.
+
+```{r}
+#| label: supp-table-7
+# Same model and same observations as the primary model. "Adjusted" is the primary model
+# (all three predictors together); "Unadjusted" fits each predictor on its own.
+supp7 <- bind_rows(
+  unadjusted %>% mutate(analysis = "Unadjusted"),
+  bind_rows(primary %>% filter(model == "Primary mixed"),
+            primary_any %>% filter(model == "Primary logistic")) %>% mutate(analysis = "Adjusted")
+) %>%
+  filter(term %in% names(term_label)) %>%
+  mutate(cell   = est_ci(effect, effect_low, effect_high),
+         column = str_c(drug_label[drug], ": ", if_else(part == "amount", "amount", "any use"))) %>%
+  select(term, analysis, column, cell) %>%
+  pivot_wider(names_from = column, values_from = cell) %>%
+  arrange(match(term, names(term_label)), match(analysis, c("Unadjusted", "Adjusted"))) %>%
+  mutate(Predictor = term_label[term]) %>%
+  select(Predictor, Analysis = analysis, `Methadone: amount`, `Buprenorphine: amount`,
+         `Methadone: any use`, `Buprenorphine: any use`)
+
+
+
+knitr::kable(supp7)
+```
+
+### Write all tables to one Word file and to CSV
+
+Adds each table, with its heading and caption, to `tables/tables.docx`, and writes a CSV copy of each table to `tables/`.
+
+```{r}
+#| label: tables-word-csv
+# Adds a heading, a caption and the table to the Word document
+add_table <- function(doc, title, caption, ft) {
+  doc %>%
+    body_add_par(title, style = "heading 2") %>%
+    body_add_par(caption, style = "Normal") %>%
+    body_add_flextable(ft) %>%
+    body_add_par("", style = "Normal")            # blank line between tables
+}
+
+doc <- read_docx() %>%
+  add_table("Table 1",
+            "Median (interquartile range) of consumption in S-DDD per million inhabitants per day, with the number of contributing countries and observations. Positive numeric country-period observations in the eight non-overlapping 3-year periods, 2000\u20132023.",
+            make_flextable(table1)) %>%
+  # The panel heading (drug + sample size) sits in a merged row above the column names
+  add_table("Table 2 (methadone)",
+            "Ratio of consumption (95% CI) among country-periods with positive use, per 10% higher GDP per person or health share and per year of life expectancy. Country fixed-effects results are in Supplementary Table 5.",
+            make_flextable(table2_meth) %>% add_header_row(values = n_label("methadone"), colwidths = 4)) %>%
+  add_table("Table 2 (buprenorphine)", "",
+            make_flextable(table2_bup) %>% add_header_row(values = n_label("buprenorphine"), colwidths = 4)) %>%
+  add_table("Table 2 continued (any use, methadone)",
+            "Whether any use was reported (1) or nil (0). Odds ratios (95% CI): for GDP and health share, per 10% higher; for life expectancy, per year. Country fixed-effects results are in Supplementary Table 5.",
+            make_flextable(table2_any_meth) %>% add_header_row(values = n_label_any("methadone"), colwidths = 4)) %>%
+  add_table("Table 2 continued (any use, buprenorphine)", "",
+            make_flextable(table2_any_bup) %>% add_header_row(values = n_label_any("buprenorphine"), colwidths = 4)) %>%
+  add_table("Table 3",
+            "Ratio of consumption per 10% higher health-spending share (95% CI) from the primary mixed model (amount among users) under each sensitivity analysis, with number of observations / countries.",
+            make_flextable(table3)) %>%
+  add_table("Table 3 continued (any use)",
+            "Odds ratio (95% CI) for any reported use per 10% higher health-spending share, from the primary logistic model under each sensitivity analysis.",
+            make_flextable(table3_any)) %>%
+  add_table("Supplementary Table 1",
+            "Between-country ratio of consumption per 10% higher health-spending share (95% CI) from OLS regressions of country averages (heteroskedasticity-robust HC1 standard errors), adjusted for GDP and life expectancy.",
+            make_flextable(supp1)) %>%
+  add_table("Supplementary Table 2",
+            "Values flagged by the diagnostic screen and retained in the primary models. Candidates for source verification, not confirmed errors.",
+            make_flextable(supp2)) %>%
+  add_table("Supplementary Table 3",
+            "Nil (dash) entries as a share of reported country-period entries, by income group.",
+            make_flextable(supp3)) %>%
+  add_table("Supplementary Table 4",
+            "Ratio per 10% higher health-spending share (95% CI) when nil values are kept in a single equation, compared with the amount-among-users model. For log(1 + consumption) the ratio applies to 1 + consumption.",
+            make_flextable(supp4)) %>%
+  add_table("Supplementary Table 5",
+            "Country fixed-effects models (country and period effects; standard errors clustered by country). Amount: ratio of consumption (95% CI) among country-periods with positive use, per 10% higher GDP and health share and per year of life expectancy. Any use: a linear probability model, in percentage points (95% CI) of the probability of any use per 10% higher GDP and health share, or per year of life expectancy.",
+            make_flextable(supp5)) %>%
+  add_table("Supplementary Table 6",
+            "Test of whether the between-country and within-country associations differ: the ratio of the between-country to the within-country association (95% CI) and p-value, from the primary model with each predictor's country average added. Amount: ratio of consumption multipliers among country-periods with positive use. Any use: ratio of odds ratios.",
+            make_flextable(supp6)) %>%
+  add_table("Supplementary Table 7",
+            "Unadjusted and adjusted associations. Unadjusted: each predictor fitted on its own in the primary model; adjusted: the primary model with GDP per person, health share and life expectancy together. Same observations in both. Amount: ratio of consumption (95% CI) among country-periods with positive use, per 10% higher GDP or health share or per year of life expectancy. Any use: odds ratio (95% CI) for any reported use, same units.",
+            make_flextable(supp7))
+
+print(doc, target = "tables/tables.docx")
+
+# CSV copies, handy for checking numbers or pasting into other software
+walk2(list(table1, table2_meth, table2_bup, table2_any_meth, table2_any_bup, table3, table3_any,
+           supp1, supp2, supp3, supp4, extra_joint, supp5, supp6, supp7),
+      c("table1", "table2_methadone", "table2_buprenorphine", "table2_any_methadone",
+        "table2_any_buprenorphine", "table3", "table3_any", "supp_table1", "supp_table2",
+        "supp_table3", "supp_table4", "extra_joint_model", "supp_table5", "supp_table6", "supp_table7"),
+      ~ write_csv(.x, str_glue("tables/{.y}.csv")))
+```
+
+### Figure style and saving helper
+
+Axis labels in Lancet style, a shared look for all figures, and a helper that saves each figure as PNG and PDF.
+
+```{r}
+#| label: figure-helpers
+# A clean, simple look shared by all figures
+# Axis labels in Lancet style: mid-dot decimals, no separator for four-digit numbers, thin space from five digits
+lancet_int <- function(x) thou(format(x, scientific = FALSE, trim = TRUE))
+lancet_dec <- function(x) str_replace(format(x, nsmall = 1, trim = TRUE), "\\.", "\u00b7")
+
+theme_set(
+  theme_classic(base_size = 11) +
+    theme(strip.background = element_blank(),               # no grey box around facet titles
+          strip.text       = element_text(face = "bold"),
+          legend.position  = "bottom")
+)
+
+# Save each figure twice: PNG for Word/slides, PDF (vector) for journals.
+# cairo_pdf is used so the en dashes in period labels print correctly.
+save_figure <- function(plot, name, width, height) {
+  ggsave(str_glue("figures/{name}.png"), plot, width = width, height = height,
+         dpi = 300, device = ragg::agg_png)
+  ggsave(str_glue("figures/{name}.pdf"), plot, width = width, height = height,
+         device = cairo_pdf)
+}
+```
+
+### Figure 1: Consumption by income group
+
+Each dot is one positive country-period observation; boxes show the median and interquartile range; the y axis is logarithmic.
+
+```{r}
+#| label: figure-1
+#| fig-width: 8
+#| fig-height: 4.5
+# Each dot is one positive country-period observation; boxes show the median and
+# interquartile range. The y axis is logarithmic. The number in parentheses is the
+# number of contributing countries.
+fig1_data <- positive %>%
+  mutate(
+    group = factor(income_group, levels = c("HIC", "UIC", "LMIC_LIC"),
+                   labels = c("HIC", "UMIC", "LMIC/LIC")),
+    drug  = factor(drug_label[drug], levels = drug_label)
+  ) %>%
+  group_by(drug, group) %>%
+  mutate(label = str_c(group, "\n(", n_distinct(country), ")")) %>%   # e.g. "HIC\n(63)"
+  ungroup() %>%
+  arrange(drug, group) %>%
+  mutate(label = factor(label, levels = unique(label)))               # keep HIC, UMIC, LMIC order
+
+fig1 <- ggplot(fig1_data, aes(label, consumption)) +
+  geom_quasirandom(colour = "grey55", alpha = 0.5, size = 0.8) +      # the individual dots
+  geom_boxplot(fill = NA, outlier.shape = NA, width = 0.5) +          # box on top; dots already show outliers
+  scale_y_log10(labels = lancet_int) +
+  facet_wrap(~ drug, scales = "free_x") +                              # free_x so each panel shows its own counts
+  labs(x = NULL, y = "S-DDD per million inhabitants per day (log scale)")
+
+save_figure(fig1, "figure1_income_groups", 8, 4.5)
+
+
+
+fig1
+```
+
+### Figure 2: US, Canada and other high-income countries over time
+
+The US and Canada against the median and interquartile range of other high-income countries.
+
+```{r}
+#| label: figure-2
+#| fig-width: 9
+#| fig-height: 4.5
+# The peer median and interquartile range come from script 01 (peers = high-income
+# countries other than the US and Canada with at least `peer_min_periods` numeric periods).
+peers   <- read_csv("results/peer_series.csv",     show_col_types = FALSE) %>%
+  mutate(drug = factor(drug_label[drug], levels = drug_label), period = str_replace(period, "-", "\u2013"))
+us_can  <- read_csv("results/us_canada_series.csv", show_col_types = FALSE) %>%
+  mutate(drug = factor(drug_label[drug], levels = drug_label), period = str_replace(period, "-", "\u2013"))
+
+fig2 <- ggplot() +
+  # grey band = interquartile range of the peers
+  geom_ribbon(data = peers, aes(period, ymin = q1, ymax = q3, group = drug), fill = "grey80") +
+  # dark line = peer median
+  geom_line(data = peers,
+            aes(period, median, group = drug, colour = "Other high-income median (IQR)"),
+            linewidth = 0.9) +
+  # coloured lines = the US and Canada
+  geom_line(data = us_can, aes(period, consumption, group = country, colour = country), linewidth = 0.9) +
+  scale_colour_manual(values = c(US = "#b2182b", Canada = "#2166ac",
+                                 "Other high-income median (IQR)" = "grey25"),
+                      name = NULL) +
+  scale_y_continuous(labels = lancet_int) +
+  facet_wrap(~ drug) +
+  labs(x = NULL, y = "S-DDD per million inhabitants per day") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))            # tilt the long period labels
+
+save_figure(fig2, "figure2_us_canada_peers", 9, 4.5)
+
+
+
+fig2
+```
+
+### Figure 3: Coefficient plot (income and health share)
+
+Points are estimates and bars are 95% CIs; open points are not statistically significant.
+
+```{r}
+#| label: figure-3
+#| fig-width: 8
+#| fig-height: 4.2
+# Points are estimates; bars are 95% CIs. Open points are not statistically
+# significant (p >= 0.05). Shows the primary model and the between / within split; the country
+# fixed-effects results are in Supplementary Table 5.
+fig3_data <- primary %>%
+  filter(term %in% c("log_gdp", "log_health"),            # income and health spending only
+         model %in% model_order_main) %>%
+  mutate(
+    model       = factor(model, levels = rev(model_order_main)),   # rev() so "Primary mixed" is on top
+    predictor   = factor(term_label[term], levels = term_label[c("log_gdp", "log_health")]),
+    drug        = factor(drug_label[drug], levels = drug_label),
+    significant = p.value < 0.05
+  )
+
+fig3 <- ggplot(fig3_data, aes(effect, model)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +        # "no association" line (ratio = 1)
+  geom_errorbarh(aes(xmin = effect_low, xmax = effect_high), height = 0.2) +
+  geom_point(aes(fill = significant), shape = 21, size = 2.8, colour = "black") +
+  scale_fill_manual(values = c(`TRUE` = "black", `FALSE` = "white"), guide = "none") +
+  scale_x_log10(breaks = c(0.9, 1, 1.1, 1.2, 1.3, 1.4), labels = lancet_dec) +                    # a ratio scale: equal distances are equal multiples
+  facet_grid(predictor ~ drug) +                                              # rows = predictor, columns = drug
+  labs(x = "Ratio of consumption per 10% higher GDP or health share (95% CI)", y = NULL)
+
+save_figure(fig3, "figure3_coefficients", 8, 4.2)
+
+
+
+fig3
+```
+
+### Supplementary Figure 1: Mean consumption in lower-income and upper-middle-income countries
+
+Mean consumption by medication in overlapping three-year windows. Built from the panel file, so it does not need the results files.
+
+```{r}
+#| label: supp-figure-1
+#| fig-width: 9
+#| fig-height: 4.8
+# Mean methadone and buprenorphine consumption in low- or lower-middle-income (LMIC/LIC) and upper-middle-income
+# (UMIC) countries, using overlapping three-year windows (2000-2002 to 2021-2023). The mean is taken over positive
+# numeric country-period observations (the same observations that Table 1 and Figure 1 summarise): nil (dash) and "<<"
+# entries are not in the mean. The five-year windows 1996-2000 and 1997-2001 are left out because they start before
+# the 2000-2023 study period.
+panel_raw <- read_csv(infile, show_col_types = FALSE)
+
+supp_fig1_windows <- panel_raw %>%
+  filter(!is.na(income_type), income_type %in% c("LMIC_LIC", "UIC")) %>%
+  mutate(start_year = as.integer(substr(time, 1, 4)),
+         end_year   = as.integer(substr(time, 6, 9))) %>%
+  filter(start_year >= 2000, end_year - start_year == 2)           # overlapping 3-year windows
+
+supp_fig1_data <- bind_rows(
+  supp_fig1_windows %>% transmute(country, income_type, time, drug = "Methadone",     value = q_m),
+  supp_fig1_windows %>% transmute(country, income_type, time, drug = "Buprenorphine", value = q_b)
+) %>%
+  filter(!is.na(value), value > 0) %>%                             # positive numeric entries only
+  group_by(income_type, drug, time) %>%
+  summarise(mean_sddd = mean(value), n_countries = n_distinct(country), .groups = "drop") %>%
+  mutate(
+    time        = str_replace(time, "-", "\u2013"),
+    income_type = factor(income_type, levels = c("LMIC_LIC", "UIC"),
+                         labels = c("LMIC/LIC", "UMIC")),
+    drug        = factor(drug, levels = c("Methadone", "Buprenorphine"))
+  )
+
+write_csv(supp_fig1_data, "figures/supp_figure1_data.csv")                   # the plotted values
+
+supp_fig1 <- ggplot(supp_fig1_data, aes(time, mean_sddd, colour = drug, group = drug)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  scale_colour_manual(values = c(Methadone = "#d95f02", Buprenorphine = "#2166ac"), name = NULL) +
+  scale_y_continuous(labels = lancet_int) +
+  facet_wrap(~ income_type, scales = "free_y") +
+  labs(x = NULL, y = "Mean S-DDD per million inhabitants per day") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 8))
+
+save_figure(supp_fig1, "supp_figure1_lower_income_means", 9, 4.8)
+
+supp_fig1
+```
+
